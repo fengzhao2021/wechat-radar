@@ -103,6 +103,12 @@ class Post:
     is_quote: bool = False
     urls: list[str] = field(default_factory=list)
     url: str = ""
+    # 仅博主后台导出才有
+    link_clicks: int | None = None
+    profile_visits: int | None = None
+    new_follows: int | None = None
+    self_ad: bool | None = None      # 数据里自带的"是否广告"标注
+    self_brand: str = ""
     # 分析字段
     category: str = "其他"
     ad_score: int = 0
@@ -175,7 +181,8 @@ def _date(v) -> datetime | None:
         return datetime.fromtimestamp(ts, tz=timezone.utc)
     s = str(v).strip()
     for fmt in ("%a %b %d %H:%M:%S %z %Y", "%Y-%m-%dT%H:%M:%S.%f%z", "%Y-%m-%dT%H:%M:%S%z",
-                "%Y-%m-%d %H:%M:%S%z", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d", "%Y/%m/%d %H:%M"):
+                "%Y-%m-%d %H:%M:%S%z", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d", "%Y/%m/%d %H:%M",
+                "%Y/%m/%d", "%Y-%m-%d %H:%M %z", "%a, %b %d, %Y", "%b %d, %Y"):
         try:
             d = datetime.strptime(s.replace("Z", "+0000"), fmt)
             return d if d.tzinfo else d.replace(tzinfo=CST)
@@ -188,10 +195,54 @@ def _date(v) -> datetime | None:
         return None
 
 
+# 表格类数据（模板 / X 后台导出 / 手工整理）的列名 → 统一字段名，匹配时忽略大小写、空格和括号里的备注
+COLUMN_ALIASES = {
+    "id": ["推文id", "帖子id", "post id", "tweet id", "id"],
+    "created_at": ["发布时间", "时间", "date", "time", "created at", "createdat"],
+    "text": ["正文", "内容", "post text", "tweet text", "text"],
+    "url": ["帖子链接", "链接", "post link", "tweet permalink", "url"],
+    "类型": ["类型", "帖子类型", "type"],
+    "viewCount": ["浏览量", "曝光", "曝光量", "impressions", "views", "viewcount"],
+    "likeCount": ["点赞", "喜欢", "likes", "likecount"],
+    "retweetCount": ["转推", "转发", "reposts", "retweets", "retweetcount"],
+    "replyCount": ["评论", "回复数", "replies", "replycount"],
+    "quoteCount": ["引用", "quotes", "quotecount"],
+    "bookmarkCount": ["收藏", "书签", "bookmarks", "bookmarkcount"],
+    "link_clicks": ["链接点击", "url clicks", "link clicks"],
+    "profile_visits": ["主页访问", "profile visits", "user profile clicks"],
+    "new_follows": ["新增关注", "new follows", "follows"],
+    "self_ad": ["是否广告", "广告", "is_ad", "sponsored"],
+    "self_brand": ["合作品牌", "品牌", "brand"],
+    "urls": ["外链", "推广链接", "links"],
+}
+_ALIAS_INDEX = {a: canon for canon, names in COLUMN_ALIASES.items() for a in names}
+
+
+def canon_row(row: dict) -> dict:
+    out = {}
+    for k, v in row.items():
+        if k is None:
+            continue
+        key = re.sub(r"[（(].*?[)）]", "", str(k)).strip().lower()
+        canon = _ALIAS_INDEX.get(key) or _ALIAS_INDEX.get(key.replace(" ", "")) or str(k)
+        if canon not in out or out[canon] in (None, ""):
+            out[canon] = v
+    kind = str(out.get("类型") or "")
+    if kind:
+        out.setdefault("isReply", "回复" in kind or "reply" in kind.lower())
+        out.setdefault("isRetweet", "转推" in kind or "retweet" in kind.lower() or "repost" in kind.lower())
+        out.setdefault("isQuote", "引用" in kind or "quote" in kind.lower())
+    return out
+
+
 def normalize(raw: dict, username: str) -> Post | None:
-    """兼容 X API v2、Apify tweet scraper、twitterapi.io 以及常见 CSV 列名。"""
+    """兼容 X API v2、Apify tweet scraper、twitterapi.io、X 后台导出以及数据模板。"""
     pm = raw.get("public_metrics") or {}
     tid = str(_first(raw, "id", "id_str", "tweet_id", "tweetId", "推文ID", default="")).strip()
+    link = str(_first(raw, "url", "twitterUrl", "链接", default="") or "")
+    if not re.fullmatch(r"\d+", tid):
+        m = re.search(r"/status/(\d+)", link)
+        tid = m.group(1) if m else ""
     created = _date(_first(raw, "created_at", "createdAt", "date", "time", "timestamp", "发布时间"))
     if not tid or not created:
         return None
@@ -239,15 +290,35 @@ def normalize(raw: dict, username: str) -> Post | None:
                                                                          "bookmarks", "收藏")) or 0,
         is_reply=is_reply, is_retweet=is_rt, is_quote=is_quote,
         urls=[u for u in urls if u],
-        url=_first(raw, "url", "twitterUrl", "链接", default="") or f"https://x.com/{username}/status/{tid}",
+        url=link or f"https://x.com/{username}/status/{tid}",
+        link_clicks=_int(raw.get("link_clicks")),
+        profile_visits=_int(raw.get("profile_visits")),
+        new_follows=_int(raw.get("new_follows")),
+        self_ad=_bool(raw["self_ad"]) if str(raw.get("self_ad") or "").strip() else None,
+        self_brand=str(raw.get("self_brand") or "").strip(),
     )
+
+
+def read_xlsx(path: Path) -> list[dict]:
+    """读取数据模板的"推文明细"工作表（没有则读第一个表）。需要 openpyxl。"""
+    try:
+        import openpyxl
+    except ImportError:
+        raise SystemExit("读取 .xlsx 需要 openpyxl：pip install openpyxl（或把工作表另存为 CSV）")
+    wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+    ws = next((wb[n] for n in wb.sheetnames if "推文" in n or "post" in n.lower()), wb.worksheets[0])
+    it = ws.iter_rows(values_only=True)
+    header = [str(h).strip() if h is not None else "" for h in next(it, [])]
+    return [dict(zip(header, r)) for r in it if any(c not in (None, "") for c in r)]
 
 
 def load_posts(path: Path, username: str) -> list[Post]:
     rows: list[dict] = []
     if path.suffix.lower() == ".csv":
         with path.open(encoding="utf-8-sig", newline="") as f:
-            rows = list(csv.DictReader(f))
+            rows = [canon_row(r) for r in csv.DictReader(f)]
+    elif path.suffix.lower() in (".xlsx", ".xlsm"):
+        rows = [canon_row(r) for r in read_xlsx(path)]
     else:
         text = path.read_text(encoding="utf-8").strip()
         if path.suffix.lower() == ".jsonl" or (text.startswith("{") and "\n{" in text):
@@ -364,6 +435,12 @@ def summarize(ps: list[Post], followers: int | None = None) -> dict:
         "er_weighted": tot_i / tot_v if tot_v else None,          # 总互动 / 总浏览
         "er_median": _median([p.er for p in ps]),                  # 单帖互动率中位数
         "er_followers": (_mean([p.interactions for p in ps]) / followers) if followers and ps else None,
+        "avg_link_clicks": _mean([p.link_clicks for p in ps]),
+        "ctr": (sum(p.link_clicks for p in ps if p.link_clicks is not None and p.views) /
+                sum(p.views for p in ps if p.link_clicks is not None and p.views))
+        if any(p.link_clicks is not None and p.views for p in ps) else None,
+        "avg_profile_visits": _mean([p.profile_visits for p in ps]),
+        "avg_new_follows": _mean([p.new_follows for p in ps]),
     }
 
 
@@ -390,6 +467,10 @@ def analyze(posts: list[Post], as_of: datetime, days: int, ad_days: int, followe
     for p in window:
         p.category = classify(p, categories)
         detect_ad(p)
+        if p.self_ad is not None:
+            p.is_ad = p.self_ad
+            p.ad_brand = p.self_brand or p.ad_brand
+            p.ad_reasons.append("数据自带标注")
         if overrides and p.id in overrides:
             p.is_ad, brand = overrides[p.id]
             p.ad_brand = brand or p.ad_brand
@@ -640,7 +721,14 @@ def render_md(r: dict, user: str) -> str:
           f"| 浏览中位数 | {fn(a['median_views'])} | {fn(g['median_views'])} |",
           f"| 平均互动 | {fn(a['avg_interactions'])} | {fn(g['avg_interactions'])} |",
           f"| 加权互动率 | {fn(a['er_weighted'], True)} | {fn(g['er_weighted'], True)} |",
-          f"| 单帖互动率中位数 | {fn(a['er_median'], True)} | {fn(g['er_median'], True)} |", "",
+          f"| 单帖互动率中位数 | {fn(a['er_median'], True)} | {fn(g['er_median'], True)} |"]
+    if a["avg_link_clicks"] is not None or g["avg_link_clicks"] is not None:
+        L += [f"| 平均链接点击 | {fn(a['avg_link_clicks'])} | {fn(g['avg_link_clicks'])} |",
+              f"| 链接点击率（点击/浏览） | {fn(a['ctr'], True)} | {fn(g['ctr'], True)} |"]
+    if a["avg_profile_visits"] is not None or g["avg_profile_visits"] is not None:
+        L += [f"| 平均主页访问 | {fn(a['avg_profile_visits'])} | {fn(g['avg_profile_visits'])} |",
+              f"| 平均新增关注 | {fn(a['avg_new_follows'])} | {fn(g['avg_new_follows'])} |"]
+    L += ["",
           "| 品牌 | 期数 | 帖数 | 浏览中位数 | 平均互动 | 加权互动率 |", "|---|---|---|---|---|---|"]
     for b in r["brand_stats"]:
         L.append(f"| {b['brand']} | {b['campaigns']} | {b['posts']} | {fn(b['median_views'])} | "

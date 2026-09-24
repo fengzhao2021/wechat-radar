@@ -20,9 +20,17 @@ python3 x_report.py fetch --user PhyrexNi --days 365 --out phyrexni.json
 把导出的 JSON / JSONL / CSV 直接交给 `analyze` 即可。常见字段名都能识别：
 `createdAt / viewCount / likeCount / retweetCount / replyCount / quoteCount / bookmarkCount / isReply / isRetweet`。
 
-**C. 手工整理的 CSV**
+**C. 请博主提供（数据最全，推荐和 B 对照使用）**
 
-至少需要 `id, created_at, text, views, likes, retweets, replies` 这几列（也支持中文列名：推文ID、发布时间、正文、浏览量、点赞、转推、评论）。
+把 `templates/KOL数据模板.xlsx` 和 `templates/数据需求说明.md` 发给博主。博主可以直接发 X 后台
+（Analytics → Content → Export data）导出的 CSV，也可以填模板。两种都能直接交给 `analyze`，
+并且会多出**链接点击、链接点击率、主页访问、新增关注**这些只有后台才有的指标。
+模板里博主自己标注的“是否广告 / 合作品牌”会覆盖自动识别结果。
+读取 .xlsx 需要 `pip install openpyxl`；模板用 `python3 make_template.py` 重新生成。
+
+**D. 手工整理的 CSV**
+
+至少需要 `id（或帖子链接）, created_at, text, views, likes, retweets, replies` 这几列，也支持模板里的中文列名。
 
 ## 2. 生成报告
 
