@@ -67,7 +67,7 @@ AD_WEAK = ["福利", "活动", "奖池", "抽奖", "合作", "partner", "注册"
 # 常见投放品牌（交易所 / 券商 / 外汇 / 钱包 / 数据工具）
 AD_BRANDS: dict[str, list[str]] = {
     "Binance": ["binance", "币安"], "OKX": ["okx", "欧易"], "Bitget": ["bitget"], "Bybit": ["bybit"],
-    "Gate": ["gate.io", "gate.com", "gate "], "HTX": ["htx", "火币"], "MEXC": ["mexc", "抹茶"],
+    "Gate": ["gate.io", "gate.com", "@gate", "gate "], "HTX": ["htx", "火币"], "MEXC": ["mexc", "抹茶"],
     "KuCoin": ["kucoin"], "Coinbase": ["coinbase"], "BingX": ["bingx"], "WEEX": ["weex"],
     "Backpack": ["backpack"], "Hyperliquid": ["hyperliquid"], "Aster": ["aster"], "Pionex": ["pionex", "派网"],
     "CoinW": ["coinw"], "LBank": ["lbank"], "BitMart": ["bitmart"], "Toobit": ["toobit"],
@@ -304,6 +304,14 @@ def detect_ad(p: Post) -> None:
         reasons.append("品牌+外链")
     elif brands and weak_hits:
         score += 1
+    # 结尾署名式植入，如"一个 @Gate ，交易更多市场"：最后一段很短且提到品牌
+    lines = [ln.strip() for ln in p.text.lower().splitlines() if ln.strip()]
+    tail = lines[-1] if len(lines) > 1 else ""
+    tail_brands = [b for b, kws in AD_BRANDS.items() if any(k.strip() in tail for k in kws)] if tail else []
+    if tail_brands and len(tail) <= 40:
+        score += 3
+        reasons.append("结尾品牌署名" + ("(@提及)" if "@" in tail else ""))
+        brands = tail_brands + [b for b in brands if b not in tail_brands]
     p.ad_brand = " / ".join(brands[:3])
     p.ad_score = score
     p.ad_reasons = reasons
@@ -511,19 +519,28 @@ def short(t: str, n=60):
 def verdict(r: dict) -> list[str]:
     o, t, a, g = r["overall"], r["trend"], r["ad_summary"], r["organic_summary"]
     out = []
+    if o["posts"] and o["with_views"] < o["posts"] * 0.5:
+        out.append(f"⚠ 数据缺少浏览量：{o['posts']} 条主贴中只有 {o['with_views']} 条带 viewCount，浏览相关指标不可信，"
+                   "请重新导出包含浏览量的数据；以下互动率改用粉丝数口径。")
     mc = t["views_median_chg"]
     if mc is not None:
         word = "上升" if mc > 0.1 else "下滑" if mc < -0.1 else "基本持平"
         out.append(f"流量趋势：近 90 天主贴浏览中位数 {fn(t['last90']['median_views'])}，较前 90 天 {signed(mc)}，"
                    f"整体{word}。")
+    if o["er_weighted"] is None and o["er_followers"] is not None:
+        out.append(f"互动质量：单帖平均互动 {fn(o['avg_interactions'])}，粉丝互动率 {fn(o['er_followers'], True)}"
+                   "（平均互动/粉丝数）。")
     if o["er_weighted"] is not None:
         lvl = "较高" if o["er_weighted"] >= 0.02 else "中等" if o["er_weighted"] >= 0.008 else "偏低"
         out.append(f"互动质量：全年加权互动率 {fn(o['er_weighted'], True)}（互动/浏览），在加密类中文 KOL 中属于{lvl}水平"
                    "（经验区间：<0.8% 偏低，0.8%–2% 中等，>2% 较高）。")
     if r["ads"]:
         ratio = (a["median_views"] / g["median_views"]) if a["median_views"] and g["median_views"] else None
+        basis = "浏览中位数"
+        if ratio is None and a["avg_interactions"] and g["avg_interactions"]:
+            ratio, basis = a["avg_interactions"] / g["avg_interactions"], "平均互动"
         out.append(f"商业化程度：近 {r['ad_days']} 天识别到 {len(r['ads'])} 条推广帖、{len(r['campaigns'])} 期合作，"
-                   f"覆盖 {len(r['brand_stats'])} 个品牌；推广帖浏览中位数为自然帖的 "
+                   f"覆盖 {len(r['brand_stats'])} 个品牌；推广帖{basis}为自然帖的 "
                    f"{fn(ratio, True) if ratio else '—'}。")
         if ratio is not None:
             out.append("广告承接：推广帖流量衰减小，粉丝对商业内容接受度好。" if ratio >= 0.7 else
