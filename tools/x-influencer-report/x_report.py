@@ -955,8 +955,16 @@ def cmd_analyze(args) -> None:
     if followers is None and src.suffix.lower() == ".json":
         try:
             meta = json.loads(src.read_text(encoding="utf-8"))
-            followers = meta.get("user", {}).get("public_metrics", {}).get("followers_count") if isinstance(meta, dict) else None
-        except (json.JSONDecodeError, AttributeError):
+            if isinstance(meta, dict):
+                followers = meta.get("user", {}).get("public_metrics", {}).get("followers_count")
+            else:
+                # Apify 每条推文带 author.followers，取最新一条本人推文的值
+                own = [m for m in meta if isinstance(m, dict) and str(_first(m, "author.userName", default="")).lower()
+                       == args.user.lower() and _first(m, "author.followers") is not None]
+                if own:
+                    latest = max(own, key=lambda m: _date(m.get("createdAt")) or datetime.min.replace(tzinfo=CST))
+                    followers = _int(latest["author"]["followers"])
+        except (json.JSONDecodeError, AttributeError, TypeError):
             pass
     categories = DEFAULT_CATEGORIES
     if args.config:
